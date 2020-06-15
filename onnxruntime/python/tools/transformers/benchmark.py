@@ -51,6 +51,8 @@ from optimizer import optimize_model, optimize_by_onnxruntime
 from BertOnnxModel import BertOptimizationOptions
 from quantize import quantize, QuantizationMode
 
+from transformers.modeling_utils import Conv1D
+
 logger = logging.getLogger('')
 
 # List of pretrained models: https://huggingface.co/transformers/pretrained_models.html
@@ -349,9 +351,58 @@ def get_latency_result(runtimes, batch_size):
         "QPS": "{:.2f}".format(throughput),
     }
 
+def inference_ort(ort_session, ort_inputs, result_template, repeat_times, batch_size):
+    result = {}
+    ort_session.run(None, ort_inputs)
+    runtimes = timeit.repeat(lambda: ort_session.run(None, ort_inputs), number=1, repeat=repeat_times)
+    result.update(result_template)
+    result.update({"io_binding": False})
+    result.update(get_latency_result(runtimes, batch_size))
+    return result
+
+
+def inference_ort_with_io_binding(ort_session, ort_inputs, result_template, repeat_times, ort_output_names, ort_outputs,
+                                  output_buffers, max_last_state_size, max_pooler_size, batch_size, device):
+    result = {}
+
+    # Bind inputs and outputs to onnxruntime session
+    io_binding = ort_session.io_binding()
+    # Bind inputs to device
+    for name in ort_inputs.keys():
+        np_input = torch.from_numpy(ort_inputs[name]).to(device)
+        io_binding.bind_input(name, np_input.device.type, 0, numpy.longlong, np_input.shape, np_input.data_ptr())
+    has_pooler = True if len(ort_output_names) == 2 else False
+    # Bind outputs buffers with the sizes needed if not allocated already
+    if output_buffers["last_state"] is None:
+        allocateOutputBuffers(output_buffers, max_last_state_size, max_pooler_size, device, has_pooler)
+    last_state_buffer = output_buffers["last_state"]
+    pooler_buffer = output_buffers["pooler"]
+    io_binding.bind_output(ort_output_names[0], last_state_buffer.device.type, 0, numpy.float32, ort_outputs[0].shape,
+                           last_state_buffer.data_ptr())
+    if has_pooler:
+        io_binding.bind_output(ort_output_names[1], pooler_buffer.device.type, 0, numpy.float32, ort_outputs[1].shape,
+                               pooler_buffer.data_ptr())
+
+    ort_session.run_with_iobinding(io_binding)
+    runtimes = timeit.repeat(lambda: ort_session.run_with_iobinding(io_binding), number=1, repeat=repeat_times)
+    result.update(result_template)
+    result.update({"io_binding": True})
+    result.update(get_latency_result(runtimes, batch_size))
+    return result
+
+
+def allocateOutputBuffers(output_buffers, max_last_state_size, max_pooler_size, device, has_pooler=False):
+    # Allocate output tensors with the largest test size needed. So the allocated memory can be reused
+    # for each test run.
+    # dummy last state
+    if output_buffers["last_state"] is None:
+        output_buffers["last_state"] = torch.empty(max_last_state_size, dtype=torch.float32, device=device)
+    # create dummy pooler
+    if output_buffers["pooler"] is None and has_pooler:
+        output_buffers["pooler"] = torch.empty(max_pooler_size, dtype=torch.float32, device=device)
 
 def run_onnxruntime(use_gpu, model_names, fp16, batch_sizes, sequence_lengths, repeat_times, input_counts,
-                    optimize_onnx, validate_onnx, cache_dir, onnx_dir, verbose, overwrite, quantize, single_thread):
+                    optimize_onnx, validate_onnx, cache_dir, onnx_dir, verbose, overwrite, quantize, single_thread, disable_ort_io_binding):
     import onnxruntime
 
     results = []
@@ -383,38 +434,81 @@ def run_onnxruntime(use_gpu, model_names, fp16, batch_sizes, sequence_lengths, r
             if ort_session is None:
                 continue
 
+            ort_output_names = [node_arg.name for node_arg in ort_session.get_outputs()]
+            output_buffers = {"last_state": None, "pooler": None}
+            device = "cuda" if use_gpu else "cpu"
+            config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir)
+            max_last_state_size = numpy.prod(
+                [max(batch_sizes), max(sequence_lengths),
+                 max(vocab_size, config.hidden_size)])
+            max_pooler_size = numpy.prod([max(batch_sizes), config.hidden_size])
             for batch_size in batch_sizes:
                 if batch_size <= 0:
                     continue
+
                 for sequence_length in sequence_lengths:
                     if max_sequence_length is not None and sequence_length > max_sequence_length:
                         continue
-                    logger.info(f"sequence_length:{sequence_length}")
-                    ort_input = create_onnxruntime_input(vocab_size, batch_size, sequence_length, input_names)
+                    ort_inputs = create_onnxruntime_input(vocab_size, batch_size, sequence_length, input_names)
 
-                    logger.info("Run onnxruntime on {} with input shape {}".format(model_name,
-                                                                                   [batch_size, sequence_length]))
-                    runtimes = timeit.repeat(lambda: ort_session.run(None, ort_input), number=1, repeat=repeat_times)
-
-                    result = {
+                    result_template = {
                         "engine": "onnxruntime",
                         "version": onnxruntime.__version__,
-                        "device": "cuda" if use_gpu else "cpu",
+                        "device": device,
                         "optimizer": optimize_onnx,
                         "fp16": fp16,
+                        "io_binding": False,
                         "model_name": model_name,
                         "inputs": num_inputs,
                         "batch_size": batch_size,
                         "sequence_length": sequence_length,
                         "datetime": str(datetime.now()),
                     }
-
-                    result.update(get_latency_result(runtimes, batch_size))
-                    logger.info(result)
-                    results.append(result)
+                    logger.info("Run onnxruntime on {} with input shape {}".format(model_name,
+                                                                                   [batch_size, sequence_length]))
+                    if not disable_ort_io_binding:
+                        logger.info("Run onnxruntime with io binding on {} with input shape {}".format(
+                            model_name, [batch_size, sequence_length]))
+                        # Get output sizes from a dummy ort run
+                        ort_outputs = ort_session.run(ort_output_names, ort_inputs)
+                        result = inference_ort_with_io_binding(ort_session, ort_inputs, result_template, repeat_times,
+                                                               ort_output_names, ort_outputs, output_buffers,
+                                                               max_last_state_size, max_pooler_size, batch_size, device)
+                        logger.info(result)
+                        results.append(result)
+                    else:
+                        result = inference_ort(ort_session, ort_inputs, result_template, repeat_times, batch_size)
+                        logger.info(result)
+                        results.append(result)
 
     return results
 
+def _conv1d_to_linear(module):
+    in_size, out_size = module.weight.shape
+    linear = torch.nn.Linear(in_size, out_size)
+    linear.weight.data = module.weight.data.T.contiguous()
+    linear.bias.data = module.bias.data
+    return linear
+
+
+def conv1d_to_linear(model):
+    '''in-place
+    This is for Dynamic Quantization, as Conv1D is not recognized by PyTorch, convert it to nn.Linear
+    '''
+    for name in list(model._modules):
+        module = model._modules[name]
+        if isinstance(module, Conv1D):
+            linear = _conv1d_to_linear(module)
+            model._modules[name] = linear
+            print(name)
+        else:
+            conv1d_to_linear(module)
+
+def quantize_model(model, dtype=torch.qint8):
+    # TODO: mix of in-place and return, but results are different
+    # Usage model = quantize_model(model)
+    conv1d_to_linear(model)
+    return torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=dtype)
 
 def run_pytorch(use_gpu, model_names, fp16, batch_sizes, sequence_lengths, repeat_times, torchscript, cache_dir,
                 verbose, quantize, single_thread):
@@ -441,7 +535,8 @@ def run_pytorch(use_gpu, model_names, fp16, batch_sizes, sequence_lengths, repea
         model.to(device)
 
         if quantize:
-            model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear, torch.nn.Conv1d}, dtype=torch.qint8)
+            conv1d_to_linear(model)
+            model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
 
         for batch_size in batch_sizes:
             if batch_size <= 0:
@@ -488,9 +583,9 @@ def run_pytorch(use_gpu, model_names, fp16, batch_sizes, sequence_lengths, repea
 def output_details(results, csv_filename):
     with open(csv_filename, mode="a", newline='') as csv_file:
         column_names = [
-            "engine", "version", "device", "fp16", "optimizer", "model_name", "inputs", "batch_size", "sequence_length",
-            "datetime", "test_times", "QPS", "average_latency_ms", "latency_variance", "latency_50_percentile", "latency_90_percentile",
-            "latency_95_percentile", "latency_99_percentile"
+            "engine", "version", "device", "fp16", "optimizer", "io_binding", "model_name", "inputs", "batch_size",
+            "sequence_length", "datetime", "test_times", "QPS", "average_latency_ms", "latency_variance", "latency_50_percentile",
+            "latency_90_percentile", "latency_95_percentile", "latency_99_percentile"
         ]
 
         csv_writer = csv.DictWriter(csv_file, fieldnames=column_names)
@@ -503,7 +598,7 @@ def output_details(results, csv_filename):
 
 def output_summary(results, csv_filename, args):
     with open(csv_filename, mode="a", newline='') as csv_file:
-        header_names = ["model_name", "inputs", "engine", "version", "device", "fp16", "optimizer"]
+        header_names = ["model_name", "inputs", "engine", "version", "device", "fp16", "optimizer", "io_binding"]
         data_names = []
         for batch_size in args.batch_sizes:
             for sequence_length in args.sequence_lengths:
@@ -514,21 +609,25 @@ def output_summary(results, csv_filename, args):
         for model_name in args.models:
             for input_count in [1, 2, 3]:
                 for engine_name in args.engines:
-                    row = {}
-                    for result in results:
-                        if result["model_name"] == model_name and result["inputs"] == input_count and result[
-                                "engine"] == engine_name:
-                            headers = {k: v for k, v in result.items() if k in header_names}
-                            if not row:
-                                row.update(headers)
-                                row.update({k: "" for k in data_names})
-                            else:
-                                for k in header_names:
-                                    assert row[k] == headers[k]
-                            b = result["batch_size"]
-                            s = result["sequence_length"]
-                            row[f"b{b}_s{s}"] = result["latency_50_percentile"]
-                    csv_writer.writerow(row)
+                    for io_binding in [True, False, ""]:
+                        row = {}
+                        for result in results:
+                            if "io_binding" not in result:
+                                result["io_binding"] = True
+                            if result["model_name"] == model_name and result["inputs"] == input_count and result[
+                                    "engine"] == engine_name and result["io_binding"] == io_binding:
+                                headers = {k: v for k, v in result.items() if k in header_names}
+                                if not row:
+                                    row.update(headers)
+                                    row.update({k: "" for k in data_names})
+                                else:
+                                    for k in header_names:
+                                        assert row[k] == headers[k]
+                                b = result["batch_size"]
+                                s = result["sequence_length"]
+                                row[f"b{b}_s{s}"] = result["average_latency_ms"]
+                        if row:
+                            csv_writer.writerow(row)
 
     logger.info(f"Summary results are saved to csv file: {csv_filename}")
 
@@ -631,6 +730,11 @@ def parse_arguments():
 
     parser.add_argument("-q", "--quantize", required=False, action="store_true", help="Run quantization model")
     parser.add_argument("--single_thread", required=False, action="store_true", help="Run quantization model")
+    parser.add_argument('--disable_ort_io_binding',
+                        required=False,
+                        action='store_true',
+                        help='Disable running ONNX Runtime with binded inputs and outputs. ')
+    parser.set_defaults(disable_ort_io_binding=False)
 
     args = parser.parse_args()
     return args
@@ -682,7 +786,7 @@ def main():
         try:
             results += run_onnxruntime(args.use_gpu, args.models, args.fp16, args.batch_sizes, args.sequence_lengths,
                                        args.test_times, args.input_counts, args.optimize_onnx, args.validate_onnx,
-                                       args.cache_dir, args.onnx_dir, args.verbose, args.overwrite, args.quantize, args.single_thread)
+                                       args.cache_dir, args.onnx_dir, args.verbose, args.overwrite, args.quantize, args.single_thread, args.disable_ort_io_binding)
         except:
             logger.error(f"Exception", exc_info=True)
 
