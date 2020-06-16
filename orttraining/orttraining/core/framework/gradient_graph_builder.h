@@ -57,6 +57,7 @@ class GradientGraphBuilder {
                        const std::unordered_set<std::string>& y_node_arg_names,
                        const std::unordered_set<std::string>& x_node_arg_names,
                        std::string loss_node_arg_name,
+                       const GradientGraphConfiguration& gradient_graph_config,
                        const bool set_gradient_as_graph_output = false);
 
   Status Build();
@@ -71,6 +72,8 @@ class GradientGraphBuilder {
   Graph* graph_;
 
   std::string loss_node_arg_name_;
+
+  const GradientGraphConfiguration& gradient_graph_config_;
 
   onnxruntime::GraphTransformerManager graph_transformation_mgr_{5};
 
