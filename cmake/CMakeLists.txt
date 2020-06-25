@@ -183,12 +183,12 @@ if(onnxruntime_ENABLE_LTO)
 endif()
 
 if(onnxruntime_DISABLE_RTTI)
+  add_compile_definitions(ORT_NO_RTTI GOOGLE_PROTOBUF_NO_RTTI)
   if(MSVC)
     # Disable RTTI and turn usage of dynamic_cast and typeid into errors
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/GR->" "$<$<COMPILE_LANGUAGE:CXX>:/we4541>")
-    add_compile_definitions(ORT_NO_RTTI GOOGLE_PROTOBUF_NO_RTTI)
   else()
-    message(SEND_ERROR "Disabling RTTI is currently only supported in MSVC")
+    add_compile_options("-fno-rtti")
   endif()
 endif()
 
